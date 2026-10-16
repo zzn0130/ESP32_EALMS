@@ -2,90 +2,154 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 
-// 板上 LED 引脚（开发板丝印 D2 = GPIO2）
-#define LED_PIN 2
+// ================= 配置 =================
+const char *WIFI_SSID     = "vivo X100 Pro";
+const char *WIFI_PASSWORD = "66666666";
 
-// 门开关状态检测引脚（ESP32 开发板 D15 = GPIO15）
-#define DETECT_PIN 15
+// 上位机（调试台）在同一热点下的 IP
+const char *SERVER_HOST = "10.13.132.226";
+const int   SERVER_PORT = 8080;
+// =======================================
 
-#define DEBOUNCE_TIME 50  //去抖时间长度
+#define DEVICE_NO      "DM001"
+#define DOOR_PATH      "/api/device/door/event"
+#define HEARTBEAT_PATH "/api/device/heartbeat"
 
-// ===== WiFi 配置（改成你自己的 WiFi 名称和密码）=====
-const char *WIFI_SSID     = "你的WiFi名称";
-const char *WIFI_PASSWORD = "你的WiFi密码";
+#define DETECT_PIN 15            // 门磁 DO：低=门关，高=门开
+#define LED_PIN    2             // 板载 LED
 
-// 寻找 WiFi 时每 0.5S 打印一个点
-#define WIFI_DOT_INTERVAL 500
+#define DEBOUNCE_TIME      200UL     // 去抖时间(ms)：门磁信号干净，200ms 足够
+#define WIFI_DOT_INTERVAL  500UL     // 找网打点间隔(ms)
+#define SERVER_TIMEOUT     1500      // 单次 HTTP 超时(ms)
+#define RETRY_MAX          3         // 失败重发次数
+#define RETRY_DELAY        1000UL    // 重发间隔(ms)
+#define HEARTBEAT_INTERVAL 30000UL   // 心跳周期(ms)，30~60s
+#define PENDING_MAX        4         // 待上报队列长度
 
-// ===== 服务器配置（门状态上报地址）=====
-const char *SERVER_URL = "http://10.10.128.166:8080/door";
+// ---- 运行状态 ----
+static bool door_open = false;               // 当前门状态
+static bool wifiConnecting   = false;
+static bool wifiWasConnected = false;
+static unsigned long lastWifiDotTime   = 0;
+static unsigned long lastHeartbeatTime = 0;
+static String deviceMacSuffix = "0000";
+static unsigned long eventSeq = 0;
 
-//门状态：0为关闭，1为打开
-static bool door_status = 0;
-
-// WiFi 连接状态
-static bool wifiConnecting    = false;  // 是否正在寻找/连接中
-static bool wifiWasConnected  = false;  // 上一次是否已连接（用于检测掉线）
-static unsigned long lastWifiDotTime = 0;  // 上一次打印 "." 的时刻
-
-// 在串口打印当前门状态
-static void printDoorStatus() {
-  Serial.print("当前门状态: ");
-  Serial.println(door_status == 1 ? "打开" : "关闭");
+// 事件唯一 ID：设备号-MAC后4位-millis-序号（重发时保持不变，服务端据此去重）
+static String makeEventId() {
+  return String(DEVICE_NO) + "-" + deviceMacSuffix + "-" +
+         String(millis()) + "-" + String(eventSeq++);
 }
 
-// 通过 HTTP POST 把门开关状态发送到服务器
-static void sendDoorStatus(bool open) {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi 未连接，发送失败");
-    return;
+// 读门磁电平：高=门开
+static bool readDoorOpen() { return digitalRead(DETECT_PIN) == HIGH; }
+
+// 同步门状态到变量与 LED（门开→灯灭，门关→灯亮）
+static void applyDoorState(bool open) {
+  door_open = open;
+  digitalWrite(LED_PIN, open ? LOW : HIGH);
+}
+
+// ---- 待上报队列：事件先入队，由 loop() 控制节奏发送，不用 delay() 阻塞 ----
+struct Pending {
+  bool   used;
+  String path;
+  String body;
+  int    attempts;          // 已尝试次数
+  unsigned long nextTryAt;  // 下次可尝试的时刻
+};
+
+static Pending pending[PENDING_MAX];
+
+// 入队一条请求
+static bool enqueueRequest(const char *path, const String &body) {
+  for (int i = 0; i < PENDING_MAX; i++) {
+    if (!pending[i].used) {
+      pending[i].used      = true;
+      pending[i].path      = path;
+      pending[i].body      = body;
+      pending[i].attempts  = 0;
+      pending[i].nextTryAt = millis();      // 立即尝试
+      return true;
+    }
   }
+  Serial.println("上报队列已满，丢弃该事件");
+  return false;
+}
 
+// 单次 HTTP POST，只看 HTTP 层是否成功
+static bool postOnce(const String &url, const String &body) {
   HTTPClient http;
-  http.begin(SERVER_URL);
+  http.begin(url);
   http.addHeader("Content-Type", "application/json");
-  http.setTimeout(3000);
-
-  String body = String("{\"door\":\"") + (open ? "open" : "closed") +
-                "\",\"door_status\":" + (open ? 1 : 0) + "}";
+  http.setTimeout(SERVER_TIMEOUT);
 
   int code = http.POST(body);
-  if (code > 0) {
-    Serial.print("已发送门状态: ");
-    Serial.print(open ? "open" : "closed");
-    Serial.print("，HTTP ");
-    Serial.println(code);
-  } else {
-    Serial.print("发送门状态失败: ");
-    Serial.println(http.errorToString(code));
-  }
-
   http.end();
+
+  return (code >= 200 && code < 300);
 }
 
-// 非阻塞地发起 WiFi 连接：未连接时每 0.5S 打印一个 "."，连上后打印提示
+// 由 loop() 驱动：只处理到期的请求，发完立即返回
+static void processPending() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  for (int i = 0; i < PENDING_MAX; i++) {
+    Pending &ev = pending[i];
+    if (!ev.used) continue;
+    if ((long)(millis() - ev.nextTryAt) < 0) continue;   // 还没到重发时刻
+
+    String url = String("http://") + SERVER_HOST + ":" + SERVER_PORT + ev.path;
+    ev.attempts++;
+
+    if (postOnce(url, ev.body)) {
+      Serial.printf("上报成功  %s\n", ev.body.c_str());
+      ev.used = false;
+    } else if (ev.attempts >= RETRY_MAX) {
+      Serial.printf("上报失败(已试 %d 次)，放弃  %s\n", ev.attempts, ev.body.c_str());
+      ev.used = false;
+    } else {
+      ev.nextTryAt = millis() + RETRY_DELAY;             // 1s 后再试，不阻塞
+    }
+  }
+}
+
+// 上报门事件
+static void sendDoorEvent(bool open) {
+  String body = String("{\"deviceNo\":\"") + DEVICE_NO +
+                "\",\"eventType\":\"" + (open ? "OPEN" : "CLOSE") +
+                "\",\"eventId\":\"" + makeEventId() + "\"}";
+  enqueueRequest(DOOR_PATH, body);
+}
+
+// 上报心跳
+static void sendHeartbeat() {
+  enqueueRequest(HEARTBEAT_PATH, String("{\"deviceNo\":\"") + DEVICE_NO + "\"}");
+}
+
+// 非阻塞 WiFi 连接维护：寻找中每 0.5s 打点，掉线自动重连
 static void handleWiFi() {
   if (WiFi.status() == WL_CONNECTED) {
     if (!wifiWasConnected) {
-      // 刚连接成功
       wifiWasConnected = true;
       wifiConnecting   = false;
-      Serial.println();
-      Serial.println("连接成功");
-      Serial.print("IP 地址: ");
-      Serial.println(WiFi.localIP());
-      printDoorStatus();
+      Serial.printf("\n连接成功  IP=%s  服务器=%s:%d\n",
+                    WiFi.localIP().toString().c_str(), SERVER_HOST, SERVER_PORT);
+
+      // 上电（或重连）后补报一次当前门状态，让上位机对齐
+      applyDoorState(readDoorOpen());
+      Serial.printf("当前门状态: %s\n", door_open ? "打开" : "关闭");
+      sendDoorEvent(door_open);
+      lastHeartbeatTime = millis();
     }
     return;
   }
 
-  // 未连接：检测是否为掉线
   if (wifiWasConnected) {
     wifiWasConnected = false;
     Serial.println("WiFi 断开，重新寻找...");
   }
 
-  // 第一次（或重新）发起连接
   if (!wifiConnecting) {
     wifiConnecting = true;
     Serial.println("寻找WIFI中...");
@@ -95,7 +159,6 @@ static void handleWiFi() {
     return;
   }
 
-  // 寻找过程中每 0.5S 打印一个点
   if (millis() - lastWifiDotTime >= WIFI_DOT_INTERVAL) {
     lastWifiDotTime = millis();
     Serial.println(".");
@@ -103,63 +166,51 @@ static void handleWiFi() {
 }
 
 void setup() {
-  // LED 引脚配置为输出模式
-  // 板载 LED 默认为低电平，LED 引脚初始化为高电平（LED 亮）
   pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);          // 上电默认灯亮
 
-  // D15 配置为输入模式（检测外部电平）
-  //检测干簧管传感器数据，门关（磁铁靠近）为低电平，门开（磁铁远离离）为高电平
-  pinMode(DETECT_PIN, INPUT);
+  pinMode(DETECT_PIN, INPUT);           // 门磁 DO：门关(磁铁靠近)=低，门开=高
 
-  // 串口初始化，方便调试（波特率 115200）
   Serial.begin(115200);
-  Serial.println("D15 level detect started (GPIO15)");
-  Serial.println("HIGH -> LED OFF, LOW -> LED ON");
+  Serial.printf("Door node %s started (DETECT_PIN=%d)\n", DEVICE_NO, DETECT_PIN);
 
-  // 上电后搜寻 WiFi 并连接（非阻塞，在 loop 里持续推进）
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  char buf[5];
+  snprintf(buf, sizeof(buf), "%02X%02X", mac[4], mac[5]);
+  deviceMacSuffix = String(buf);
+
   handleWiFi();
 }
 
 void loop() {
-  // 维护 WiFi 连接：寻找中每 0.5S 打印一个点，掉线自动重连
   handleWiFi();
 
-  // 读取 D15 外部电平
+  // ---- 门状态：去抖 + 跳变沿检测 ----
+  static int lastRawLevel = digitalRead(DETECT_PIN);
+  static int stableLevel  = lastRawLevel;
+  static unsigned long lastChangeTime = 0;
+
   int level = digitalRead(DETECT_PIN);
 
-  // 去抖：电平变化后需保持稳定超过 DEBOUNCE_TIME 才认为有效
-  static int lastRawLevel = level;             // 上一次读到的原始电平
-  static int stableLevel = level;              // 已确认的稳定电平
-  static unsigned long lastChangeTime = 0;     // 最近一次电平变化的时刻
-
   if (level != lastRawLevel) {
-    // 原始电平发生变化，重置计时
     lastRawLevel = level;
     lastChangeTime = millis();
   }
 
-  // 已稳定且与当前有效状态不同，才执行状态切换
   if ((millis() - lastChangeTime >= DEBOUNCE_TIME) && (stableLevel != lastRawLevel)) {
     stableLevel = lastRawLevel;
-
-    if (stableLevel == HIGH) {
-      // 高电平：门开（磁铁远离）→ 灯灭
-      door_status = 1;
-      digitalWrite(LED_PIN, LOW);
-      Serial.println("Door ON");
-      printDoorStatus();
-      // 检测到开门动作，通过 WiFi 上报
-      sendDoorStatus(true);
-    } else {
-      // 低电平：门关（磁铁靠近）→ 灯亮
-      door_status = 0;
-      digitalWrite(LED_PIN, HIGH);
-      Serial.println("Door OFF");
-      printDoorStatus();
-      // 检测到关门动作，通过 WiFi 上报
-      sendDoorStatus(false);
-    }
+    applyDoorState(stableLevel == HIGH);
+    Serial.printf("门事件: %s\n", door_open ? "OPEN" : "CLOSE");
+    sendDoorEvent(door_open);
   }
-  
 
+  // ---- 周期心跳（非阻塞）----
+  if (wifiWasConnected && (millis() - lastHeartbeatTime >= HEARTBEAT_INTERVAL)) {
+    lastHeartbeatTime = millis();
+    sendHeartbeat();
+  }
+
+  // ---- 驱动上报队列（非阻塞）----
+  processPending();
 }

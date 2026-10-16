@@ -17,6 +17,13 @@ const int   SERVER_PORT = 8080;
 
 #define DETECT_PIN 15            // 门磁 DO：低=门关，高=门开
 #define LED_PIN    2             // 板载 LED
+#define LED_ON_LEVEL  HIGH       // 本板 HIGH=亮；若是低电平板改成 LOW
+#define LED_OFF_LEVEL LOW
+
+#define LED_WIFI_BLINK 100UL     // 未连 WiFi 快闪半周期(ms)：100ms → 约 5Hz
+#define LED_TX_ON      60UL      // 发送提示：亮时长(ms)
+#define LED_TX_GAP     60UL      // 发送提示：灭间隔(ms)
+#define LED_TX_PULSES  2         // 发送提示闪几下
 
 #define DEBOUNCE_TIME      200UL     // 去抖时间(ms)：门磁信号干净，200ms 足够
 #define WIFI_DOT_INTERVAL  500UL     // 找网打点间隔(ms)
@@ -44,10 +51,50 @@ static String makeEventId() {
 // 读门磁电平：高=门开
 static bool readDoorOpen() { return digitalRead(DETECT_PIN) == HIGH; }
 
-// 同步门状态到变量与 LED（门开→灯灭，门关→灯亮）
+// 同步门状态到变量（LED 已改由 updateLed() 统一管理，不再反映门状态）
 static void applyDoorState(bool open) {
   door_open = open;
-  digitalWrite(LED_PIN, open ? LOW : HIGH);
+}
+
+// ---- LED 指示 ----
+// 未连 WiFi：一直快闪；已连 WiFi：常灭；每发送一次：快闪 2 下
+static unsigned long ledNextAt   = 0;      // 下次动作时刻
+static bool ledBlinkOn           = false;  // 快闪当前相位
+static int  txPulsesLeft         = 0;      // 剩余待闪次数
+static bool txPulseOn            = false;  // 发送提示当前是否处于“亮”
+
+// 请求一次“发送提示”（快闪 LED_TX_PULSES 下）
+static void triggerTxBlink() {
+  txPulsesLeft = LED_TX_PULSES;
+  txPulseOn    = false;
+  ledNextAt    = millis();                 // 立即开始
+}
+
+// 由 loop() 驱动，统一决定 LED 亮灭
+static void updateLed() {
+  unsigned long now = millis();
+
+  // 1) 发送提示优先：一亮一灭算闪一下
+  if (txPulsesLeft > 0) {
+    if ((long)(now - ledNextAt) < 0) return;
+    txPulseOn = !txPulseOn;
+    digitalWrite(LED_PIN, txPulseOn ? LED_ON_LEVEL : LED_OFF_LEVEL);
+    if (!txPulseOn) txPulsesLeft--;        // 每次灭代表闪完一下
+    ledNextAt = now + (txPulseOn ? LED_TX_ON : LED_TX_GAP);
+    return;
+  }
+
+  // 2) 未连 WiFi：一直快闪
+  if (!wifiWasConnected) {
+    if ((long)(now - ledNextAt) < 0) return;
+    ledBlinkOn = !ledBlinkOn;
+    digitalWrite(LED_PIN, ledBlinkOn ? LED_ON_LEVEL : LED_OFF_LEVEL);
+    ledNextAt = now + LED_WIFI_BLINK;
+    return;
+  }
+
+  // 3) 已连 WiFi 且空闲：不亮
+  digitalWrite(LED_PIN, LED_OFF_LEVEL);
 }
 
 // ---- 待上报队列：事件先入队，由 loop() 控制节奏发送，不用 delay() 阻塞 ----
@@ -101,6 +148,8 @@ static void processPending() {
 
     String url = String("http://") + SERVER_HOST + ":" + SERVER_PORT + ev.path;
     ev.attempts++;
+
+    triggerTxBlink();                    // 发送提示：LED 快闪两下
 
     if (postOnce(url, ev.body)) {
       Serial.printf("上报成功  %s\n", ev.body.c_str());
@@ -167,7 +216,7 @@ static void handleWiFi() {
 
 void setup() {
   pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, HIGH);          // 上电默认灯亮
+  digitalWrite(LED_PIN, LED_OFF_LEVEL); // 默认灭，之后交给 updateLed() 控制
 
   pinMode(DETECT_PIN, INPUT);           // 门磁 DO：门关(磁铁靠近)=低，门开=高
 
@@ -213,4 +262,7 @@ void loop() {
 
   // ---- 驱动上报队列（非阻塞）----
   processPending();
+
+  // ---- LED 指示 ----
+  updateLed();
 }

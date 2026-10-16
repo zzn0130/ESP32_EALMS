@@ -82,7 +82,7 @@ const int   SERVER_PORT = 8080;
 #define LED_TX_GAP     60UL      // 发送信息提示：两次点亮之间的熄灭时长
 #define LED_TX_PULSES  2         // 发送提示闪几下
 
-#define DEBOUNCE_TIME      200UL     // 去抖：电平跳变后需持续稳定这么久才认定为有效事件
+#define DEBOUNCE_TIME      500UL     // 去抖：电平跳变后需持续稳定这么久才认定为有效事件
                                      // 越小延迟越低，越大越抗抖动；门磁信号干净，200ms 足够
 #define WIFI_DOT_INTERVAL  500UL     // 连接 WiFi 期间，串口打 “.” 的间隔（表示连接中）
 #define SERVER_TIMEOUT     1500      // 单次 HTTP 超时（含建连与读响应），失败时会阻塞这么久
